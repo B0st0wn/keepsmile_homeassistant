@@ -31,7 +31,9 @@ Add this repo to HACS as a custom repo.  Click through:
 
 ## Credits
 
-Thanks to themooer1 for the OG fork:
+This fork is maintained by [@B0st0wn](https://github.com/B0st0wn).
+
+Original integration by themooer1:
 
 <https://github.com/themooer1/keepsmile_homeassistant>
 

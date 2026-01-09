@@ -45,18 +45,18 @@
   ],
   "domain": "keepsmile",
   "name": "Keepsmile",
-  "codeowners": ["@themooer1"],
+  "codeowners": ["@B0st0wn"],
   "config_flow": true,
   "dependencies": ["bluetooth_adapters"],
-  "documentation": "https://github.com/themooer1/keepsmile_homeassistant",
+  "documentation": "https://github.com/B0st0wn/keepsmile_homeassistant",
   "integration_type": "device",
   "iot_class": "local_polling",
-  "issue_tracker": "https://github.com/themooer1/keepsmile_homeassistant/issues",
+  "issue_tracker": "https://github.com/B0st0wn/keepsmile_homeassistant/issues",
   "requirements": [
     "bluetooth-data-tools",
     "bleak-retry-connector",
     "bleak",
     "cheshire @ git+https://github.com/Rooky030/cheshire"
   ],
-  "version": "0.0.2"
+  "version": "0.0.3"
 }
