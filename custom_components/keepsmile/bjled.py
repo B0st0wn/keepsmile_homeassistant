@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 from homeassistant.components import bluetooth
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.components.light import (ColorMode)
@@ -82,6 +83,9 @@ EFFECT_LIST = [e.value for e in Effect]
 DEFAULT_ATTEMPTS = 3
 BLEAK_BACKOFF_TIME = 0.25
 RETRY_BACKOFF_EXCEPTIONS = (BleakDBusError)
+RECONNECT_BASE_DELAY = 1
+RECONNECT_MAX_ATTEMPTS = 3
+RECONNECT_EXCEPTIONS = (ConnectionError, BleakNotFoundError, *BLEAK_EXCEPTIONS)
 
 WrapFuncType = TypeVar("WrapFuncType", bound=Callable[..., Any])
 
@@ -145,6 +149,7 @@ def retry_bluetooth_connection_error(func: WrapFuncType) -> WrapFuncType:
                     err,
                     exc_info=True,
                 )
+                await asyncio.sleep(BLEAK_BACKOFF_TIME)
 
     return cast(WrapFuncType, _async_wrap_retry_bluetooth_connection_error)
 
@@ -154,7 +159,10 @@ class BJLEDInstance:
         self.loop = asyncio.get_running_loop()
         self._mac = address
         self._reset = reset
-        self._delay = delay
+        try:
+            self._delay = max(0, int(delay))
+        except (TypeError, ValueError):
+            self._delay = 0
         self._hass = hass
         self._device: BLEDevice | None = None
         self._device = bluetooth.async_ble_device_from_address(self._hass, address)
@@ -165,6 +173,7 @@ class BJLEDInstance:
         self._connect_lock: asyncio.Lock = asyncio.Lock()
         self._client: BleakClientWithServiceCache | None = None
         self._disconnect_timer: asyncio.TimerHandle | None = None
+        self._reconnect_task: asyncio.Task | None = None
         self._cached_services: BleakGATTServiceCollection | None = None
         self._expected_disconnect = False
         self._is_on = None
@@ -199,11 +208,15 @@ class BJLEDInstance:
     def _detect_model(self, device: BLEDevice):
         profile = device_profile_from_ble_device(device)
         if profile is None:
-            LOGGER.debug(
-                "Bluetooth device has an unrecognized name: %s. MAC: %s",
+            raise ConfigEntryNotReady(
+                f"Unsupported Bluetooth LED controller: {device.name} ({device.address})"
+            )
+
+        LOGGER.debug(
+            "Bluetooth device recognized: %s. MAC: %s",
                 device.name,
                 device.address
-            )
+        )
 
         self._compiler = profile.compiler()
         
@@ -222,6 +235,8 @@ class BJLEDInstance:
         platform_commands = self._compiler.compile(self._state)
         LOGGER.debug(f"Sending commands to {self.name}: {platform_commands}")
         await self._ensure_connected()
+        if self._transmitter is None:
+            raise ConnectionError(f"{self.name}: no transmitter available after connect")
         await self._transmitter.send_all(platform_commands)
 
     @property
@@ -268,16 +283,14 @@ class BJLEDInstance:
     async def set_rgb_color(self, rgb: Tuple[int, int, int], brightness: int | None = None):
         self._rgb_color = rgb
         if brightness is None:
-            if self._brightness is None:
-                self._brightness = 254
-            else:
-                brightness = self._brightness
+            brightness = self._brightness if self._brightness is not None else 254
+        self._brightness = brightness
         # RGB packet
         self._state.update(RGBCommand(*rgb))
         self._state.update(BrightnessCommand(brightness))
         await self._write_state()
 
-
+    @retry_bluetooth_connection_error
     async def set_brightness_local(self, brightness: int):
         # 0 - 254, should convert automatically with the hex calls
         # call color temp or rgb functions to update
@@ -341,6 +354,13 @@ class BJLEDInstance:
             if self._client and self._client.is_connected:
                 self._reset_disconnect_timer()
                 return
+
+            current_ble_device = bluetooth.async_ble_device_from_address(
+                self._hass, self._mac
+            )
+            if current_ble_device:
+                self._device = current_ble_device
+
             LOGGER.debug("%s: Connecting", self.name)
             client = await establish_connection(
                 BleakClientWithServiceCache,
@@ -354,9 +374,9 @@ class BJLEDInstance:
 
             self._cached_services = None
             self._transmitter = None
+            transmitter: Transmitter | None = None
             try:
                 transmitter = self._model.get_transmitter(client)
-
             except ConnectionError:
                 LOGGER.debug("Connection failed: failed to wrap client with transmitter", exc_info=True)
 
@@ -364,35 +384,81 @@ class BJLEDInstance:
                 try:
                     services = await client.get_services()
                     LOGGER.debug(f"Tried reloading characteristrics: {services.characteristics}")
-                    transmitter = self._model.get_transmitter(self._client)
+                    transmitter = self._model.get_transmitter(client)
 
-                except ConnectionError:
+                except ConnectionError as err:
                     LOGGER.debug("Connection failed (x2): failed to wrap client with transmitter", exc_info=True)
+                    with contextlib.suppress(Exception):
+                        await client.disconnect()
+                    raise ConnectionError("failed to initialize BLE transmitter") from err
+
             self._cached_services = client.services
 
             self._client = client
             self._transmitter = transmitter
+            self._reconnect_task = None
             self._reset_disconnect_timer()
 
     def _reset_disconnect_timer(self) -> None:
         """Reset disconnect timer."""
         if self._disconnect_timer:
             self._disconnect_timer.cancel()
+            self._disconnect_timer = None
+
         self._expected_disconnect = False
-        if self._delay is not None and self._delay != 0:
+        if self._delay > 0:
             LOGGER.debug(
                 "%s: Configured disconnect from device in %s seconds",
                 self.name,
                 self._delay
             )
             self._disconnect_timer = self.loop.call_later(self._delay, self._disconnect)
+        else:
+            LOGGER.debug("%s: Persistent connection enabled (no idle disconnect)", self.name)
 
     def _disconnected(self, client: BleakClientWithServiceCache) -> None:
         """Disconnected callback."""
+        if self._disconnect_timer:
+            self._disconnect_timer.cancel()
+            self._disconnect_timer = None
+
+        self._client = None
+        self._transmitter = None
+
         if self._expected_disconnect:
             LOGGER.debug("%s: Disconnected from device", self.name)
+            self._expected_disconnect = False
             return
+
         LOGGER.warning("%s: Device unexpectedly disconnected", self.name)
+        self._schedule_reconnect()
+
+    def _schedule_reconnect(self) -> None:
+        """Schedule a background reconnect when persistent mode is enabled."""
+        if self._delay > 0:
+            return
+        if self._reconnect_task and not self._reconnect_task.done():
+            return
+        self._reconnect_task = self.loop.create_task(self._reconnect_after_disconnect())
+
+    async def _reconnect_after_disconnect(self) -> None:
+        """Try reconnecting in the background after an unexpected disconnect."""
+        for attempt in range(1, RECONNECT_MAX_ATTEMPTS + 1):
+            try:
+                await asyncio.sleep(RECONNECT_BASE_DELAY * attempt)
+                await self._ensure_connected()
+                LOGGER.debug("%s: Background reconnect successful", self.name)
+                return
+            except RECONNECT_EXCEPTIONS as err:
+                LOGGER.debug(
+                    "%s: Background reconnect attempt %s/%s failed: %s",
+                    self.name,
+                    attempt,
+                    RECONNECT_MAX_ATTEMPTS,
+                    err,
+                    exc_info=True,
+                )
+        LOGGER.debug("%s: Background reconnect attempts exhausted", self.name)
 
     def _disconnect(self) -> None:
         """Disconnect from device."""
@@ -402,6 +468,14 @@ class BJLEDInstance:
     async def stop(self) -> None:
         """Stop the LEDBLE."""
         LOGGER.debug("%s: Stop", self.name)
+        if self._disconnect_timer:
+            self._disconnect_timer.cancel()
+            self._disconnect_timer = None
+        if self._reconnect_task and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._reconnect_task
+            self._reconnect_task = None
         await self._execute_disconnect()
 
     async def _execute_timed_disconnect(self) -> None:
@@ -422,7 +496,10 @@ class BJLEDInstance:
             self._client = None
             self._transmitter = None
             if client and client.is_connected:
-                # Calls client.disconnect internally
-                await transmitter.close()
+                if transmitter:
+                    # Calls client.disconnect internally
+                    await transmitter.close()
+                else:
+                    await client.disconnect()
             LOGGER.debug("%s: Disconnected", self.name)
     

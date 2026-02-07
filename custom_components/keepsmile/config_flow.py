@@ -132,7 +132,15 @@ class BJLEDFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             if "flicker" in user_input:
                 if user_input["flicker"]:
-                    return self.async_create_entry(title=self.name, data={CONF_MAC: self.mac, "name": self.name})
+                    return self.async_create_entry(
+                        title=self.name,
+                        data={
+                            CONF_MAC: self.mac,
+                            "name": self.name,
+                            CONF_RESET: False,
+                            CONF_DELAY: 0,
+                        },
+                    )
                 return self.async_abort(reason="cannot_validate")
             
             if "retry" in user_input and not user_input["retry"]:
@@ -174,7 +182,7 @@ class BJLEDFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def toggle_light(self):
         if not self._instance:
-            self._instance = BJLEDInstance(self.mac, False, 120, self.hass)
+            self._instance = BJLEDInstance(self.mac, False, 0, self.hass)
         try:
             await self._instance.update()
             await self._instance.turn_on()
@@ -208,15 +216,28 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
     async def async_step_user(self, user_input=None):
         """Handle a flow initialized by the user."""
         errors = {}
-        options = self.config_entry.options or {CONF_RESET: False,CONF_DELAY: 120}
+        default_delay = self.config_entry.options.get(
+            CONF_DELAY, self.config_entry.data.get(CONF_DELAY, 0)
+        )
+        default_reset = self.config_entry.options.get(
+            CONF_RESET, self.config_entry.data.get(CONF_RESET, False)
+        )
         if user_input is not None:
-            return self.async_create_entry(title="", data={CONF_RESET: user_input[CONF_RESET], CONF_DELAY: user_input[CONF_DELAY]})
+            return self.async_create_entry(
+                title="",
+                data={
+                    CONF_RESET: default_reset,
+                    CONF_DELAY: user_input[CONF_DELAY],
+                },
+            )
 
         return self.async_show_form(
             step_id="user",
             data_schema=vol.Schema(
                 {
-                    vol.Optional(CONF_DELAY, default=options.get(CONF_DELAY)): int
+                    vol.Required(CONF_DELAY, default=default_delay): vol.All(
+                        vol.Coerce(int), vol.Range(min=0, max=3600)
+                    )
                 }
             ), errors=errors
         )

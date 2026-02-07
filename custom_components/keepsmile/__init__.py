@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, Event
 from homeassistant.const import CONF_MAC, EVENT_HOMEASSISTANT_STOP
@@ -11,10 +13,24 @@ import logging
 LOGGER = logging.getLogger(__name__)
 PLATFORMS = ["light"]
 
+
+def _entry_value(entry: ConfigEntry, key: str, default: Any) -> Any:
+    """Read a config value with options taking precedence, preserving falsy values."""
+    if key in entry.options:
+        return entry.options[key]
+    if key in entry.data:
+        return entry.data[key]
+    return default
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up from a config entry."""
-    reset = entry.options.get(CONF_RESET, None) or entry.data.get(CONF_RESET, None)
-    delay = entry.options.get(CONF_DELAY, None) or entry.data.get(CONF_DELAY, None)
+    reset = bool(_entry_value(entry, CONF_RESET, False))
+    delay = _entry_value(entry, CONF_DELAY, 0)
+    try:
+        delay = max(0, int(delay))
+    except (TypeError, ValueError):
+        delay = 0
     LOGGER.debug("Config Reset data: %s and config delay data: %s", reset, delay)
 
     instance = BJLEDInstance(entry.data[CONF_MAC], reset, delay, hass)
@@ -44,6 +60,4 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Handle options update."""
-    instance = hass.data[DOMAIN][entry.entry_id]
-    if entry.title != instance.name:
-        await hass.config_entries.async_reload(entry.entry_id)
+    await hass.config_entries.async_reload(entry.entry_id)
