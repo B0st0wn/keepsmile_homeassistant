@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import time
 from homeassistant.components import bluetooth
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.components.light import (ColorMode)
@@ -84,8 +85,9 @@ DEFAULT_ATTEMPTS = 3
 BLEAK_BACKOFF_TIME = 0.25
 RETRY_BACKOFF_EXCEPTIONS = (BleakDBusError)
 RECONNECT_BASE_DELAY = 1
-RECONNECT_MAX_ATTEMPTS = 3
+RECONNECT_MAX_DELAY = 30
 RECONNECT_EXCEPTIONS = (ConnectionError, BleakNotFoundError, *BLEAK_EXCEPTIONS)
+UNEXPECTED_DISCONNECT_LOG_INTERVAL = 60
 
 WrapFuncType = TypeVar("WrapFuncType", bound=Callable[..., Any])
 
@@ -176,6 +178,7 @@ class BJLEDInstance:
         self._reconnect_task: asyncio.Task | None = None
         self._cached_services: BleakGATTServiceCollection | None = None
         self._expected_disconnect = False
+        self._last_unexpected_disconnect_log = 0.0
         self._is_on = None
         self._rgb_color = None
         self._brightness = 254
@@ -418,6 +421,12 @@ class BJLEDInstance:
 
     def _disconnected(self, client: BleakClientWithServiceCache) -> None:
         """Disconnected callback."""
+        # Bleak can still invoke callbacks for an old client after a reconnect.
+        # Ignore stale client disconnect events so we don't drop a healthy session.
+        if self._client is not None and client is not self._client:
+            LOGGER.debug("%s: Ignoring stale client disconnect callback", self.name)
+            return
+
         if self._disconnect_timer:
             self._disconnect_timer.cancel()
             self._disconnect_timer = None
@@ -430,7 +439,12 @@ class BJLEDInstance:
             self._expected_disconnect = False
             return
 
-        LOGGER.warning("%s: Device unexpectedly disconnected", self.name)
+        now = time.monotonic()
+        if now - self._last_unexpected_disconnect_log >= UNEXPECTED_DISCONNECT_LOG_INTERVAL:
+            LOGGER.warning("%s: Device unexpectedly disconnected", self.name)
+            self._last_unexpected_disconnect_log = now
+        else:
+            LOGGER.debug("%s: Device unexpectedly disconnected", self.name)
         self._schedule_reconnect()
 
     def _schedule_reconnect(self) -> None:
@@ -443,22 +457,23 @@ class BJLEDInstance:
 
     async def _reconnect_after_disconnect(self) -> None:
         """Try reconnecting in the background after an unexpected disconnect."""
-        for attempt in range(1, RECONNECT_MAX_ATTEMPTS + 1):
+        attempt = 0
+        while self._delay == 0:
+            attempt += 1
             try:
-                await asyncio.sleep(RECONNECT_BASE_DELAY * attempt)
+                await asyncio.sleep(min(RECONNECT_BASE_DELAY * attempt, RECONNECT_MAX_DELAY))
                 await self._ensure_connected()
                 LOGGER.debug("%s: Background reconnect successful", self.name)
                 return
             except RECONNECT_EXCEPTIONS as err:
                 LOGGER.debug(
-                    "%s: Background reconnect attempt %s/%s failed: %s",
+                    "%s: Background reconnect attempt %s failed: %s",
                     self.name,
                     attempt,
-                    RECONNECT_MAX_ATTEMPTS,
                     err,
                     exc_info=True,
                 )
-        LOGGER.debug("%s: Background reconnect attempts exhausted", self.name)
+        LOGGER.debug("%s: Background reconnect stopped (non-persistent mode)", self.name)
 
     def _disconnect(self) -> None:
         """Disconnect from device."""
