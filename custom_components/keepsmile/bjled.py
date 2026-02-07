@@ -85,6 +85,7 @@ BLEAK_BACKOFF_TIME = 0.25
 RETRY_BACKOFF_EXCEPTIONS = (BleakDBusError)
 RECONNECT_BASE_DELAY = 1
 RECONNECT_MAX_DELAY = 30
+RECONNECT_CONNECT_TIMEOUT = 6
 RECONNECT_EXCEPTIONS = (ConnectionError, BleakNotFoundError, *BLEAK_EXCEPTIONS)
 UNEXPECTED_DISCONNECT_LOG_INTERVAL = 60
 
@@ -406,9 +407,15 @@ class BJLEDInstance:
             current_ble_device = bluetooth.async_ble_device_from_address(
                 self._hass, self._mac
             )
-            if not current_ble_device:
+            if current_ble_device:
+                self._device = current_ble_device
+            elif self._device is not None:
+                LOGGER.debug(
+                    "%s: Scanner has no fresh BLE advertisement, using cached BLE device",
+                    self.name,
+                )
+            else:
                 raise ConnectionError(f"{self._mac}: bluetooth device is not currently discovered")
-            self._device = current_ble_device
             self._ensure_profile()
 
             LOGGER.debug("%s: Connecting", self.name)
@@ -512,10 +519,10 @@ class BJLEDInstance:
             attempt += 1
             try:
                 await asyncio.sleep(min(RECONNECT_BASE_DELAY * attempt, RECONNECT_MAX_DELAY))
-                await self._ensure_connected()
+                await asyncio.wait_for(self._ensure_connected(), timeout=RECONNECT_CONNECT_TIMEOUT)
                 LOGGER.debug("%s: Background reconnect successful", self.name)
                 return
-            except RECONNECT_EXCEPTIONS as err:
+            except (RECONNECT_EXCEPTIONS, TimeoutError) as err:
                 LOGGER.debug(
                     "%s: Background reconnect attempt %s failed: %s",
                     self.name,
