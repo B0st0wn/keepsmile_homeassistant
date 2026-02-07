@@ -1,9 +1,8 @@
 {
     "name": "Keepsmile LED",
     "content_in_root": false,
-    "zip_release": false,
-    "filename": "",
+    "domains": ["keepsmile"],
     "render_readme": true,
     "homeassistant": "2023.11.0",
-    "hacs": "1.33.0"   
+    "hacs": "1.33.0"
 }

@@ -2,7 +2,6 @@ import asyncio
 import contextlib
 import time
 from homeassistant.components import bluetooth
-from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.components.light import (ColorMode)
 from bleak.backends.device import BLEDevice
 from bleak.backends.service import BleakGATTCharacteristic, BleakGATTServiceCollection
@@ -168,10 +167,6 @@ class BJLEDInstance:
         self._hass = hass
         self._device: BLEDevice | None = None
         self._device = bluetooth.async_ble_device_from_address(self._hass, address)
-        if not self._device:
-            raise ConfigEntryNotReady(
-                f"You need to add bluetooth integration (https://www.home-assistant.io/integrations/bluetooth) or couldn't find a nearby device with address: {address}"
-            )
         self._connect_lock: asyncio.Lock = asyncio.Lock()
         self._client: BleakClientWithServiceCache | None = None
         self._disconnect_timer: asyncio.TimerHandle | None = None
@@ -179,7 +174,7 @@ class BJLEDInstance:
         self._cached_services: BleakGATTServiceCollection | None = None
         self._expected_disconnect = False
         self._last_unexpected_disconnect_log = 0.0
-        self._is_on = None
+        self._is_on = False
         self._rgb_color = None
         self._brightness = 254
         self._effect = None
@@ -189,13 +184,13 @@ class BJLEDInstance:
         self._turn_off_cmd = None
         self._compiler: StateCompiler | None = None
         self._state: LightState = self._initial_state()
-        self._model = self._detect_model(self._device)
+        self._model = None
         self._transmitter: Transmitter | None = None
-        
+        if self._device:
+            self._model = self._detect_model(self._device)
         LOGGER.debug(
-            "Model information for device %s : ModelNo %s. MAC: %s",
-            self._device.name,
-            self._model,
+            "Keepsmile instance initialized. Device discovered=%s MAC=%s",
+            bool(self._device),
             self._mac,
         )
 
@@ -211,9 +206,12 @@ class BJLEDInstance:
     def _detect_model(self, device: BLEDevice):
         profile = device_profile_from_ble_device(device)
         if profile is None:
-            raise ConfigEntryNotReady(
-                f"Unsupported Bluetooth LED controller: {device.name} ({device.address})"
+            LOGGER.debug(
+                "Bluetooth device profile not recognized yet: %s (%s)",
+                device.name,
+                device.address,
             )
+            return None
 
         LOGGER.debug(
             "Bluetooth device recognized: %s. MAC: %s",
@@ -231,6 +229,49 @@ class BJLEDInstance:
             self._color_mode = ColorMode.ONOFF
         
         return profile
+
+    def _ensure_profile(self) -> None:
+        """Ensure that a supported model profile has been detected."""
+        if self._model is not None and self._compiler is not None:
+            return
+        if self._device is None:
+            raise ConnectionError(f"{self._mac}: device not available in bluetooth scanner")
+        profile = self._detect_model(self._device)
+        if profile is None or self._compiler is None:
+            raise ConnectionError(
+                f"{self._mac}: unable to identify supported profile for device"
+            )
+        self._model = profile
+
+    def restore_state(
+        self,
+        *,
+        is_on: bool | None = None,
+        brightness: int | None = None,
+        rgb_color: Tuple[int, int, int] | None = None,
+        effect: str | None = None,
+    ) -> None:
+        """Restore optimistic state values from Home Assistant's state cache."""
+        if is_on is not None:
+            self._is_on = is_on
+            self._state.update(SwitchCommand(on=is_on))
+        if brightness is not None:
+            self._brightness = int(brightness)
+            self._state.update(BrightnessCommand(self._brightness))
+        if rgb_color is not None and len(rgb_color) == 3:
+            self._rgb_color = (int(rgb_color[0]), int(rgb_color[1]), int(rgb_color[2]))
+            self._state.update(RGBCommand(*self._rgb_color))
+        if effect and effect in EFFECT_LIST:
+            self._effect = effect
+            self._state.update(EffectCommand(Effect(effect)))
+
+    async def warmup(self) -> None:
+        """Try a non-blocking startup connection so first command is faster."""
+        try:
+            await asyncio.wait_for(self._ensure_connected(), timeout=15)
+            LOGGER.debug("%s: Startup warmup successful", self.name)
+        except Exception as err:
+            LOGGER.debug("%s: Startup warmup deferred: %s", self.name, err)
             
     async def _write_state(self):
         """Sends commands to the device so its configuration matches 
@@ -244,7 +285,7 @@ class BJLEDInstance:
 
     @property
     def mac(self):
-        return self._device.address
+        return self._mac
 
     @property
     def reset(self):
@@ -252,11 +293,15 @@ class BJLEDInstance:
 
     @property
     def name(self):
-        return self._device.name
+        if self._device and self._device.name:
+            return self._device.name
+        return self._mac
 
     @property
     def rssi(self):
-        return self._device.rssi
+        if self._device:
+            return self._device.rssi
+        return None
 
     @property
     def is_on(self):
@@ -361,8 +406,10 @@ class BJLEDInstance:
             current_ble_device = bluetooth.async_ble_device_from_address(
                 self._hass, self._mac
             )
-            if current_ble_device:
-                self._device = current_ble_device
+            if not current_ble_device:
+                raise ConnectionError(f"{self._mac}: bluetooth device is not currently discovered")
+            self._device = current_ble_device
+            self._ensure_profile()
 
             LOGGER.debug("%s: Connecting", self.name)
             client = await establish_connection(
@@ -378,8 +425,11 @@ class BJLEDInstance:
             self._cached_services = None
             self._transmitter = None
             transmitter: Transmitter | None = None
+            model = self._model
+            if model is None:
+                raise ConnectionError(f"{self._mac}: supported profile not ready")
             try:
-                transmitter = self._model.get_transmitter(client)
+                transmitter = model.get_transmitter(client)
             except ConnectionError:
                 LOGGER.debug("Connection failed: failed to wrap client with transmitter", exc_info=True)
 
@@ -387,7 +437,7 @@ class BJLEDInstance:
                 try:
                     services = await client.get_services()
                     LOGGER.debug(f"Tried reloading characteristrics: {services.characteristics}")
-                    transmitter = self._model.get_transmitter(client)
+                    transmitter = model.get_transmitter(client)
 
                 except ConnectionError as err:
                     LOGGER.debug("Connection failed (x2): failed to wrap client with transmitter", exc_info=True)

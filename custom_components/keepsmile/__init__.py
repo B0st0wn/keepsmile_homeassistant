@@ -4,7 +4,11 @@ from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, Event
-from homeassistant.const import CONF_MAC, EVENT_HOMEASSISTANT_STOP
+from homeassistant.const import (
+    CONF_MAC,
+    EVENT_HOMEASSISTANT_STARTED,
+    EVENT_HOMEASSISTANT_STOP,
+)
 
 from .const import DOMAIN, CONF_RESET, CONF_DELAY
 from .bjled import BJLEDInstance
@@ -39,6 +43,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+
+    async def _async_started(_event: Event) -> None:
+        """Warm up bluetooth connection after HA startup."""
+        await instance.warmup()
+
+    if hass.is_running:
+        hass.async_create_task(instance.warmup())
+    else:
+        entry.async_on_unload(
+            hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _async_started)
+        )
 
     async def _async_stop(event: Event) -> None:
         """Close the connection."""

@@ -7,6 +7,7 @@ from .const import DOMAIN
 from homeassistant.const import CONF_MAC
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.components.light import (
     PLATFORM_SCHEMA,
     ATTR_BRIGHTNESS,
@@ -29,7 +30,7 @@ async def async_setup_entry(hass, config_entry, async_add_devices):
         [BJLEDLight(instance, config_entry.data["name"], config_entry.entry_id)]
     )
 
-class BJLEDLight(LightEntity):
+class BJLEDLight(RestoreEntity, LightEntity):
     def __init__(
         self, bjledinstance: BJLEDInstance, name: str, entry_id: str
     ) -> None:
@@ -95,6 +96,33 @@ class BJLEDLight(LightEntity):
     @property
     def should_poll(self):
         return False
+
+    async def async_added_to_hass(self) -> None:
+        """Restore last known optimistic state after HA restart."""
+        await super().async_added_to_hass()
+        last_state = await self.async_get_last_state()
+        if last_state is None:
+            return
+
+        is_on: Optional[bool] = None
+        if last_state.state in ("on", "off"):
+            is_on = last_state.state == "on"
+
+        brightness = last_state.attributes.get(ATTR_BRIGHTNESS)
+        rgb_color = last_state.attributes.get(ATTR_RGB_COLOR)
+        effect = last_state.attributes.get(ATTR_EFFECT)
+
+        rgb_tuple: Optional[Tuple[int, int, int]] = None
+        if isinstance(rgb_color, (list, tuple)) and len(rgb_color) == 3:
+            rgb_tuple = (int(rgb_color[0]), int(rgb_color[1]), int(rgb_color[2]))
+
+        self._instance.restore_state(
+            is_on=is_on,
+            brightness=brightness,
+            rgb_color=rgb_tuple,
+            effect=effect,
+        )
+        self.async_write_ha_state()
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         if not self.is_on:
