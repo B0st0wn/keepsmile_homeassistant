@@ -534,7 +534,10 @@ class BJLEDInstance:
                 await asyncio.wait_for(self._ensure_connected(), timeout=RECONNECT_CONNECT_TIMEOUT)
                 LOGGER.debug("%s: Background reconnect successful", self.name)
                 return
-            except (RECONNECT_EXCEPTIONS, TimeoutError) as err:
+            except asyncio.CancelledError:
+                LOGGER.debug("%s: Background reconnect cancelled", self.name)
+                return
+            except (*RECONNECT_EXCEPTIONS, TimeoutError) as err:
                 LOGGER.debug(
                     "%s: Background reconnect attempt %s failed: %s",
                     self.name,

@@ -58,5 +58,5 @@
     "bleak",
     "cheshire @ git+https://github.com/Rooky030/cheshire"
   ],
-  "version": "0.0.8"
+  "version": "0.0.9"
 }
