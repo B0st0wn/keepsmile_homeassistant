@@ -84,8 +84,7 @@ DEFAULT_ATTEMPTS = 3
 BLEAK_BACKOFF_TIME = 0.25
 RETRY_BACKOFF_EXCEPTIONS = (BleakDBusError)
 RECONNECT_BASE_DELAY = 1
-RECONNECT_MAX_DELAY = 30
-RECONNECT_CONNECT_TIMEOUT = 6
+RECONNECT_CONNECT_TIMEOUT = 3
 RECONNECT_EXCEPTIONS = (ConnectionError, BleakNotFoundError, *BLEAK_EXCEPTIONS)
 UNEXPECTED_DISCONNECT_LOG_INTERVAL = 60
 
@@ -390,6 +389,19 @@ class BJLEDInstance:
 
     async def _ensure_connected(self) -> None:
         """Ensure connection to device is established."""
+        # Prioritize user-initiated commands over background reconnect loops.
+        reconnect_task = self._reconnect_task
+        current_task = asyncio.current_task()
+        if (
+            reconnect_task
+            and reconnect_task is not current_task
+            and not reconnect_task.done()
+        ):
+            reconnect_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await reconnect_task
+            self._reconnect_task = None
+
         if self._connect_lock.locked():
             LOGGER.debug(
                 "%s: Connection already in progress, waiting for it to complete",
@@ -518,7 +530,7 @@ class BJLEDInstance:
         while self._delay == 0:
             attempt += 1
             try:
-                await asyncio.sleep(min(RECONNECT_BASE_DELAY * attempt, RECONNECT_MAX_DELAY))
+                await asyncio.sleep(RECONNECT_BASE_DELAY)
                 await asyncio.wait_for(self._ensure_connected(), timeout=RECONNECT_CONNECT_TIMEOUT)
                 LOGGER.debug("%s: Background reconnect successful", self.name)
                 return
